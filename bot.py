@@ -7,234 +7,488 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 import json
 import os
-from datetime import datetime
+import random
+from datetime import datetime, date
 
-TOKEN = "7819706068:AAGIGhZ36smgo_U8lci2jm9c4YEAv6r9p7Q"
-ADMIN_ID = 7423253055
+from words_data import WORDS, LEVELS_ORDER
+
+TOKEN = "СЮДА_ВСТАВЬ_СВОЙ_ТОКЕН"
 
 bot = Bot(token=TOKEN)
 router = Router()
 storage = MemoryStorage()
 
-DATA_FILE = "data.json"
+DATA_FILE = "users.json"
+
+# ---------- хранение данных ----------
 
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
-    return {"trainings": []}
+    return {}
 
 def save_data(data):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-class CreateTraining(StatesGroup):
-    waiting_for_date = State()
+def get_user(data, user_id):
+    uid = str(user_id)
+    if uid not in data:
+        data[uid] = {
+            "level": None,
+            "level_confirmed": None,
+            "goal": None,
+            "daily_time": None,
+            "lessons_done": 0,
+            "learned_words": [],
+            "current_lesson_words": [],
+            "current_lesson_index": 0,
+            "last_active": None,
+            "deadline_months": None,
+            "test_state": None,
+        }
+    return data[uid]
 
-def main_menu(user_id):
-    if user_id == ADMIN_ID:
-        return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📋 Тренировки", callback_data="list_trainings")],
-            [InlineKeyboardButton(text="➕ Создать тренировку", callback_data="create_training")],
-        ])
+# ---------- состояния ----------
+
+class Onboarding(StatesGroup):
+    waiting_level_test_answer = State()
+    waiting_lesson_answer = State()
+    waiting_quiz_answer = State()
+
+GOALS = [
+    "Работа и карьера",
+    "Путешествия",
+    "Экзамен (IELTS/TOEFL)",
+    "Переезд за границу",
+    "Учёба / университет",
+    "Для себя / хобби",
+]
+
+TIME_OPTIONS = ["15 минут", "30 минут", "1 час"]
+
+# ---------- уровень-тест (5 вопросов на проверку заявленного уровня) ----------
+
+def generate_level_test(level: str):
+    """Создаёт 5 вопросов по словам заявленного уровня для проверки."""
+    pool = WORDS.get(level, WORDS["Beginner"])
+    sample = random.sample(pool, min(5, len(pool)))
+    questions = []
+    all_words_flat = [w for lvl in WORDS.values() for w in lvl]
+    for word_en, word_ru in sample:
+        wrong_options = random.sample(
+            [w[1] for w in all_words_flat if w[1] != word_ru], 3
+        )
+        options = wrong_options + [word_ru]
+        random.shuffle(options)
+        questions.append({
+            "question": f"Переведи слово: {word_en}",
+            "options": options,
+            "correct": word_ru,
+        })
+    return questions
+
+# ---------- клавиатуры ----------
+
+def levels_kb():
+    buttons = [[InlineKeyboardButton(text=lvl, callback_data=f"level_{lvl}")] for lvl in LEVELS_ORDER]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def goals_kb():
+    buttons = [[InlineKeyboardButton(text=g, callback_data=f"goal_{i}")] for i, g in enumerate(GOALS)]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def time_kb():
+    buttons = [[InlineKeyboardButton(text=t, callback_data=f"time_{t}")] for t in TIME_OPTIONS]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Тренировки", callback_data="list_trainings")],
+        [InlineKeyboardButton(text="📚 Новый урок", callback_data="start_lesson")],
+        [InlineKeyboardButton(text="📊 Мой прогресс", callback_data="progress")],
     ])
 
+def answer_options_kb(options, prefix):
+    buttons = [[InlineKeyboardButton(text=opt, callback_data=f"{prefix}_{opt}")] for opt in options]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# ---------- /start ----------
+
 @router.message(Command("start"))
-async def start_handler(message: Message):
-    await message.answer("🏐 Волейбол Боброво", reply_markup=main_menu(message.from_user.id))
-
-@router.callback_query(F.data == "main_menu")
-async def back_to_menu(callback: CallbackQuery):
-    await callback.message.answer("🏐 Волейбол Боброво", reply_markup=main_menu(callback.from_user.id))
-    await callback.answer()
-
-@router.callback_query(F.data == "create_training")
-async def create_training(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    await callback.message.answer("Введи дату и время тренировки:\nФормат: 20.06.2025 19:00")
-    await state.set_state(CreateTraining.waiting_for_date)
-    await callback.answer()
-
-@router.message(CreateTraining.waiting_for_date)
-async def save_training(message: Message, state: FSMContext):
-    try:
-        dt = datetime.strptime(message.text.strip(), "%d.%m.%Y %H:%M")
-    except ValueError:
-        await message.answer("❌ Неверный формат! Введи так: 20.06.2025 19:00")
-        return
+async def start_handler(message: Message, state: FSMContext):
     data = load_data()
-    training = {
-        "id": len(data["trainings"]) + 1,
-        "date": message.text.strip(),
-        "datetime": dt.isoformat(),
-        "players": [],
-        "waiting": [],
-        "cancelled": False,
-        "notified_30": False,
-        "notified_10": False
-    }
-    data["trainings"].append(training)
+    user = get_user(data, message.from_user.id)
     save_data(data)
-    await state.clear()
-    await message.answer(f"✅ Тренировка создана: {message.text.strip()}", reply_markup=main_menu(ADMIN_ID))
 
-@router.callback_query(F.data == "list_trainings")
-async def list_trainings(callback: CallbackQuery):
+    if user["level_confirmed"]:
+        await message.answer(
+            f"Привет! 👋 Продолжаем изучение английского.\nТвой уровень: {user['level_confirmed']}\nПройдено уроков: {user['lessons_done']}",
+            reply_markup=main_menu_kb()
+        )
+        return
+
+    await message.answer(
+        "👋 Привет! Я твой персональный преподаватель английского.\n\n"
+        "Сначала узнаем твой уровень. Как ты сам оцениваешь свои знания английского? 📶",
+        reply_markup=levels_kb()
+    )
+
+# ---------- выбор заявленного уровня ----------
+
+@router.callback_query(F.data.startswith("level_"))
+async def chosen_level(callback: CallbackQuery, state: FSMContext):
+    level = callback.data.replace("level_", "")
     data = load_data()
-    active = [t for t in data["trainings"] if not t.get("cancelled")]
-    if not active:
-        await callback.message.answer("Нет активных тренировок", reply_markup=main_menu(callback.from_user.id))
+    user = get_user(data, callback.from_user.id)
+    user["level"] = level
+    test = generate_level_test(level)
+    user["test_state"] = {"questions": test, "index": 0, "correct": 0, "type": "level_check"}
+    save_data(data)
+
+    await callback.message.answer(
+        f"Ты выбрал уровень: {level}.\nПроверим, насколько это так — мини-тест из 5 вопросов!"
+    )
+    await ask_next_test_question(callback.message, callback.from_user.id)
+    await callback.answer()
+
+async def ask_next_test_question(message: Message, user_id: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    ts = user["test_state"]
+    idx = ts["index"]
+    if idx >= len(ts["questions"]):
+        await finish_level_test(message, user_id)
+        return
+    q = ts["questions"][idx]
+    await message.answer(
+        f"Вопрос {idx + 1}/{len(ts['questions'])}\n{q['question']}",
+        reply_markup=answer_options_kb(q["options"], "leveltest")
+    )
+
+@router.callback_query(F.data.startswith("leveltest_"))
+async def level_test_answer(callback: CallbackQuery):
+    answer = callback.data.replace("leveltest_", "")
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    ts = user["test_state"]
+    if not ts or ts.get("type") != "level_check":
         await callback.answer()
         return
-    for t in active:
-        players_count = len(t["players"])
-        waiting_count = len(t["waiting"])
-        text = f"📅 {t['date']}\n👥 Игроков: {players_count}/21\n⏳ Ожидание: {waiting_count}/10"
-        buttons = [
-            [InlineKeyboardButton(text="📋 Список", callback_data=f"view_{t['id']}")],
-            [InlineKeyboardButton(text="✅ Записаться", callback_data=f"join_{t['id']}")],
-            [InlineKeyboardButton(text="❌ Отменить запись", callback_data=f"leave_{t['id']}")],
-        ]
-        if callback.from_user.id == ADMIN_ID:
-            buttons.append([InlineKeyboardButton(text="🚫 Отменить тренировку", callback_data=f"cancel_{t['id']}")])
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        await callback.message.answer(text, reply_markup=kb)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("view_"))
-async def view_training(callback: CallbackQuery):
-    training_id = int(callback.data.split("_")[1])
-    data = load_data()
-    t = next((x for x in data["trainings"] if x["id"] == training_id), None)
-    if not t:
-        await callback.answer("Не найдено")
-        return
-    text = f"📅 {t['date']}\n\n👥 Основной состав ({len(t['players'])}/21):\n"
-    for i, p in enumerate(t["players"], 1):
-        text += f"{i}. {p['name']}\n"
-    if t["waiting"]:
-        text += f"\n⏳ Лист ожидания ({len(t['waiting'])}/10):\n"
-        for i, p in enumerate(t["waiting"], 1):
-            text += f"{i}. {p['name']}\n"
-    await callback.message.answer(text)
-    await callback.answer()
-
-@router.callback_query(F.data.startswith("join_"))
-async def join_training(callback: CallbackQuery):
-    training_id = int(callback.data.split("_")[1])
-    data = load_data()
-    t = next((x for x in data["trainings"] if x["id"] == training_id), None)
-    if not t or t.get("cancelled"):
-        await callback.answer("Тренировка не найдена или отменена", show_alert=True)
-        return
-    user_id = callback.from_user.id
-    user_name = callback.from_user.full_name
-    if any(p["id"] == user_id for p in t["players"] + t["waiting"]):
-        await callback.answer("Ты уже записан!", show_alert=True)
-        return
-    if len(t["players"]) < 21:
-        t["players"].append({"id": user_id, "name": user_name})
-        save_data(data)
-        await callback.answer(f"✅ Ты в основном составе на {t['date']}!", show_alert=True)
-    elif len(t["waiting"]) < 10:
-        t["waiting"].append({"id": user_id, "name": user_name})
-        save_data(data)
-        await callback.answer(f"⏳ Ты в листе ожидания на {t['date']}!", show_alert=True)
+    idx = ts["index"]
+    q = ts["questions"][idx]
+    if answer == q["correct"]:
+        ts["correct"] += 1
+        await callback.answer("✅ Верно!")
     else:
-        await callback.answer("❌ Все места заняты!", show_alert=True)
-
-@router.callback_query(F.data.startswith("leave_"))
-async def leave_training(callback: CallbackQuery):
-    training_id = int(callback.data.split("_")[1])
-    data = load_data()
-    t = next((x for x in data["trainings"] if x["id"] == training_id), None)
-    if not t:
-        await callback.answer("Не найдено", show_alert=True)
-        return
-    user_id = callback.from_user.id
-    if any(p["id"] == user_id for p in t["players"]):
-        t["players"] = [p for p in t["players"] if p["id"] != user_id]
-        if t["waiting"]:
-            moved = t["waiting"].pop(0)
-            t["players"].append(moved)
-            save_data(data)
-            try:
-                await bot.send_message(moved["id"], f"🎉 Ты переведён в основной состав на тренировку {t['date']}!")
-            except:
-                pass
-        else:
-            save_data(data)
-        await callback.answer("✅ Запись отменена", show_alert=True)
-    elif any(p["id"] == user_id for p in t["waiting"]):
-        t["waiting"] = [p for p in t["waiting"] if p["id"] != user_id]
-        save_data(data)
-        await callback.answer("✅ Убран из листа ожидания", show_alert=True)
-    else:
-        await callback.answer("Ты не был записан", show_alert=True)
-
-@router.callback_query(F.data.startswith("cancel_"))
-async def cancel_training(callback: CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    training_id = int(callback.data.split("_")[1])
-    data = load_data()
-    t = next((x for x in data["trainings"] if x["id"] == training_id), None)
-    if not t:
-        await callback.answer("Не найдено", show_alert=True)
-        return
-    t["cancelled"] = True
+        await callback.answer(f"❌ Неверно. Правильно: {q['correct']}")
+    ts["index"] += 1
     save_data(data)
-    all_players = t["players"] + t["waiting"]
-    for p in all_players:
-        try:
-            await bot.send_message(p["id"], f"🚫 Тренировка {t['date']} отменена администратором!")
-        except:
-            pass
-    await callback.message.answer(f"✅ Тренировка {t['date']} отменена. Уведомления отправлены.")
+    await ask_next_test_question(callback.message, callback.from_user.id)
+
+async def finish_level_test(message: Message, user_id: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    ts = user["test_state"]
+    correct = ts["correct"]
+    total = len(ts["questions"])
+    declared_level = user["level"]
+    idx_declared = LEVELS_ORDER.index(declared_level)
+
+    # если справился плохо (меньше 60%) — снижаем уровень на 1, если справился отлично (100%) и уровень не топ — можно оставить как есть
+    if correct / total < 0.6 and idx_declared > 0:
+        real_level = LEVELS_ORDER[idx_declared - 1]
+        msg = f"По результатам теста ({correct}/{total}) твой реальный уровень похож на: {real_level}, а не {declared_level}. Начнём с {real_level}!"
+    else:
+        real_level = declared_level
+        msg = f"Отлично, результат теста {correct}/{total} подтверждает твой уровень: {declared_level}!"
+
+    user["level_confirmed"] = real_level
+    user["test_state"] = None
+    save_data(data)
+
+    await message.answer(msg)
+    await message.answer(
+        "Теперь скажи — для чего тебе нужен английский? 🎯",
+        reply_markup=goals_kb()
+    )
+
+# ---------- цель ----------
+
+@router.callback_query(F.data.startswith("goal_"))
+async def chosen_goal(callback: CallbackQuery):
+    goal_idx = int(callback.data.replace("goal_", ""))
+    goal = GOALS[goal_idx]
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    user["goal"] = goal
+    save_data(data)
+
+    await callback.message.answer(
+        f"Цель: {goal}. Понял! 💪\n\nСколько времени в день готов уделять английскому?",
+        reply_markup=time_kb()
+    )
     await callback.answer()
 
-async def check_notifications():
+# ---------- время на учёбу ----------
+
+@router.callback_query(F.data.startswith("time_"))
+async def chosen_time(callback: CallbackQuery):
+    time_choice = callback.data.replace("time_", "")
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    user["daily_time"] = time_choice
+
+    # прикидываем срок обучения исходя из уровня и времени в день
+    level_idx = LEVELS_ORDER.index(user["level_confirmed"])
+    levels_to_go = len(LEVELS_ORDER) - level_idx
+    time_factor = {"15 минут": 1.5, "30 минут": 1.0, "1 час": 0.6}[time_choice]
+    months = max(2, round(levels_to_go * 3 * time_factor))
+    user["deadline_months"] = months
+    save_data(data)
+
+    await callback.message.answer(
+        f"Отлично! При {time_choice} в день, я думаю, мы дойдём до свободного владения примерно через {months} месяцев. 🚀\n\n"
+        f"Источник слов и материалов — я сам подобрал тебе слова под твой уровень ({user['level_confirmed']}), всё уже готово в базе.\n\n"
+        f"Начинаем учиться карточками! Каждый урок — 5 новых слов. После 5 уроков — мини-тест на 20 вопросов, после 10 уроков — тест на 40 вопросов.",
+        reply_markup=main_menu_kb()
+    )
+    await callback.answer()
+
+# ---------- запуск урока ----------
+
+@router.callback_query(F.data == "start_lesson")
+async def start_lesson(callback: CallbackQuery):
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+
+    if not user["level_confirmed"]:
+        await callback.answer("Сначала пройди регистрацию через /start", show_alert=True)
+        return
+
+    level = user["level_confirmed"]
+    pool = WORDS.get(level, WORDS["Beginner"])
+    learned = set(user["learned_words"])
+    available = [w for w in pool if w[0] not in learned]
+
+    if len(available) < 5:
+        # если слов уровня не хватает - переходим на след. уровень
+        idx = LEVELS_ORDER.index(level)
+        if idx + 1 < len(LEVELS_ORDER):
+            level = LEVELS_ORDER[idx + 1]
+            user["level_confirmed"] = level
+            pool = WORDS.get(level, [])
+            available = [w for w in pool if w[0] not in learned]
+        if len(available) < 5:
+            await callback.message.answer("🎉 Похоже, ты выучил все доступные слова! Скоро добавим больше материала.")
+            await callback.answer()
+            return
+
+    lesson_words = random.sample(available, 5)
+    user["current_lesson_words"] = lesson_words
+    user["current_lesson_index"] = 0
+    user["last_active"] = date.today().isoformat()
+    save_data(data)
+
+    await callback.message.answer(f"📚 Новый урок! 5 новых слов ({level}).")
+    await show_lesson_card(callback.message, callback.from_user.id)
+    await callback.answer()
+
+async def show_lesson_card(message: Message, user_id: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    idx = user["current_lesson_index"]
+    words = user["current_lesson_words"]
+
+    if idx >= len(words):
+        user["lessons_done"] += 1
+        for w in words:
+            if w[0] not in user["learned_words"]:
+                user["learned_words"].append(w[0])
+        save_data(data)
+
+        await message.answer(f"✅ Урок завершён! Всего пройдено уроков: {user['lessons_done']}")
+
+        if user["lessons_done"] % 10 == 0:
+            await start_quiz(message, user_id, 40)
+        elif user["lessons_done"] % 5 == 0:
+            await start_quiz(message, user_id, 20)
+        else:
+            await message.answer("Можешь пройти следующий урок когда захочешь!", reply_markup=main_menu_kb())
+        return
+
+    word_en, word_ru = words[idx]
+    # смешиваем направление перевода
+    direction = random.choice(["en_to_ru", "ru_to_en"])
+    all_words_flat = [w for lvl in WORDS.values() for w in lvl]
+
+    if direction == "en_to_ru":
+        wrong = random.sample([w[1] for w in all_words_flat if w[1] != word_ru], 3)
+        options = wrong + [word_ru]
+        random.shuffle(options)
+        user["test_state"] = {"type": "lesson_card", "correct": word_ru, "direction": direction}
+        text = f"Карточка {idx + 1}/5\n\n🇬🇧 {word_en}\n\nКакой перевод правильный?"
+    else:
+        wrong = random.sample([w[0] for w in all_words_flat if w[0] != word_en], 3)
+        options = wrong + [word_en]
+        random.shuffle(options)
+        user["test_state"] = {"type": "lesson_card", "correct": word_en, "direction": direction}
+        text = f"Карточка {idx + 1}/5\n\n🇷🇺 {word_ru}\n\nКакое слово правильное?"
+
+    save_data(data)
+    await message.answer(text, reply_markup=answer_options_kb(options, "lessoncard"))
+
+@router.callback_query(F.data.startswith("lessoncard_"))
+async def lesson_card_answer(callback: CallbackQuery):
+    answer = callback.data.replace("lessoncard_", "")
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    ts = user["test_state"]
+    if not ts or ts.get("type") != "lesson_card":
+        await callback.answer()
+        return
+
+    if answer == ts["correct"]:
+        await callback.answer("✅ Верно!")
+    else:
+        await callback.answer(f"❌ Неверно. Правильно: {ts['correct']}")
+
+    user["current_lesson_index"] += 1
+    save_data(data)
+    await show_lesson_card(callback.message, callback.from_user.id)
+
+# ---------- мини-тесты после 5/10 уроков ----------
+
+async def start_quiz(message: Message, user_id: int, num_questions: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    learned = user["learned_words"]
+
+    all_words_flat = [w for lvl in WORDS.values() for w in lvl]
+    learned_pairs = [w for w in all_words_flat if w[0] in learned]
+
+    if len(learned_pairs) < 4:
+        await message.answer("Недостаточно слов для теста пока, продолжай учиться!", reply_markup=main_menu_kb())
+        return
+
+    sample_size = min(num_questions, len(learned_pairs))
+    sample = random.sample(learned_pairs, sample_size)
+    # если слов меньше чем нужно вопросов - повторяем некоторые
+    questions = []
+    while len(questions) < num_questions and learned_pairs:
+        word_en, word_ru = random.choice(learned_pairs)
+        direction = random.choice(["en_to_ru", "ru_to_en"])
+        if direction == "en_to_ru":
+            wrong = random.sample([w[1] for w in all_words_flat if w[1] != word_ru], min(3, len(all_words_flat)-1))
+            options = wrong + [word_ru]
+            random.shuffle(options)
+            questions.append({"question": f"Переведи слово: {word_en}", "options": options, "correct": word_ru})
+        else:
+            wrong = random.sample([w[0] for w in all_words_flat if w[0] != word_en], min(3, len(all_words_flat)-1))
+            options = wrong + [word_en]
+            random.shuffle(options)
+            questions.append({"question": f"Какое слово значит: {word_ru}?", "options": options, "correct": word_en})
+
+    user["test_state"] = {"type": "quiz", "questions": questions, "index": 0, "correct": 0}
+    save_data(data)
+
+    await message.answer(f"📝 Мини-экзамен! {num_questions} вопросов по всем пройденным словам (вперемешку).")
+    await ask_next_quiz_question(message, user_id)
+
+async def ask_next_quiz_question(message: Message, user_id: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    ts = user["test_state"]
+    idx = ts["index"]
+    if idx >= len(ts["questions"]):
+        await finish_quiz(message, user_id)
+        return
+    q = ts["questions"][idx]
+    await message.answer(
+        f"Вопрос {idx + 1}/{len(ts['questions'])}\n{q['question']}",
+        reply_markup=answer_options_kb(q["options"], "quiz")
+    )
+
+@router.callback_query(F.data.startswith("quiz_"))
+async def quiz_answer(callback: CallbackQuery):
+    answer = callback.data.replace("quiz_", "")
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    ts = user["test_state"]
+    if not ts or ts.get("type") != "quiz":
+        await callback.answer()
+        return
+    idx = ts["index"]
+    q = ts["questions"][idx]
+    if answer == q["correct"]:
+        ts["correct"] += 1
+        await callback.answer("✅ Верно!")
+    else:
+        await callback.answer(f"❌ Неверно. Правильно: {q['correct']}")
+    ts["index"] += 1
+    save_data(data)
+    await ask_next_quiz_question(callback.message, callback.from_user.id)
+
+async def finish_quiz(message: Message, user_id: int):
+    data = load_data()
+    user = get_user(data, user_id)
+    ts = user["test_state"]
+    correct = ts["correct"]
+    total = len(ts["questions"])
+    percent = round(correct / total * 100)
+    user["test_state"] = None
+    save_data(data)
+
+    await message.answer(
+        f"🏁 Тест завершён! Результат: {correct}/{total} ({percent}%)\n\nПродолжаем учиться!",
+        reply_markup=main_menu_kb()
+    )
+
+# ---------- прогресс ----------
+
+@router.callback_query(F.data == "progress")
+async def show_progress(callback: CallbackQuery):
+    data = load_data()
+    user = get_user(data, callback.from_user.id)
+    text = (
+        f"📊 Твой прогресс:\n\n"
+        f"Уровень: {user['level_confirmed']}\n"
+        f"Цель: {user['goal']}\n"
+        f"Время в день: {user['daily_time']}\n"
+        f"Уроков пройдено: {user['lessons_done']}\n"
+        f"Слов выучено: {len(user['learned_words'])}\n"
+        f"Примерный срок до цели: {user['deadline_months']} мес."
+    )
+    await callback.message.answer(text, reply_markup=main_menu_kb())
+    await callback.answer()
+
+# ---------- ежедневные напоминания ----------
+
+async def daily_reminders():
     while True:
-        now = datetime.now()
         data = load_data()
-        changed = False
-        for t in data["trainings"]:
-            if t.get("cancelled"):
+        today = date.today().isoformat()
+        for uid, user in data.items():
+            if not user.get("level_confirmed"):
                 continue
-            try:
-                dt = datetime.fromisoformat(t["datetime"])
-            except:
-                continue
-            diff = (dt - now).total_seconds() / 60
-            if 29 <= diff <= 31 and not t.get("notified_30"):
-                t["notified_30"] = True
-                changed = True
-                for p in t["players"] + t["waiting"]:
-                    try:
-                        await bot.send_message(p["id"], f"⏰ Тренировка {t['date']} начнётся через 30 минут!")
-                    except:
-                        pass
-            if 9 <= diff <= 11 and not t.get("notified_10"):
-                t["notified_10"] = True
-                changed = True
-                for p in t["players"] + t["waiting"]:
-                    try:
-                        await bot.send_message(p["id"], f"⚡ Тренировка {t['date']} начнётся через 10 минут!")
-                    except:
-                        pass
-        if changed:
-            save_data(data)
-        await asyncio.sleep(60)
+            last_active = user.get("last_active")
+            if last_active != today:
+                try:
+                    await bot.send_message(
+                        int(uid),
+                        "👋 Не забывай про английский! Загляни на урок сегодня 📚",
+                        reply_markup=main_menu_kb()
+                    )
+                except Exception:
+                    pass
+        await asyncio.sleep(24 * 60 * 60)  # раз в сутки
+
+# ---------- запуск ----------
 
 async def main():
     dp = Dispatcher(storage=storage)
     dp.include_router(router)
-    asyncio.create_task(check_notifications())
+    asyncio.create_task(daily_reminders())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
