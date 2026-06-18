@@ -12,7 +12,7 @@ from datetime import datetime, date
 
 from words_data import WORDS, LEVELS_ORDER
 
-TOKEN = "СЮДА_ВСТАВЬ_СВОЙ_ТОКЕН"
+TOKEN = "7819706068:AAGIGhZ36smgo_U8lci2jm9c4YEAv6r9p7Q"
 
 bot = Bot(token=TOKEN)
 router = Router()
